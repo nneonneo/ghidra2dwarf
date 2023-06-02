@@ -14,13 +14,10 @@ import os
 import sys
 
 from ghidra.app.decompiler import DecompInterface, DecompileOptions
-from ghidra.app.util.bin.format.elf import ElfSymbolTable
 from ghidra.app.decompiler.component import DecompilerUtils
-from ghidra.program.database.data import PointerDB
-from ghidra.program.model.symbol import SymbolTable, SymbolType
+from ghidra.program.model.symbol import SymbolType
 from ghidra.program.model.data import Pointer, Structure, DefaultDataType, BuiltInDataType, BooleanDataType, CharDataType, AbstractIntegerDataType, AbstractFloatDataType, AbstractComplexDataType, ArrayDataType, Array, Enum
 from ghidra.app.util.bin.format.dwarf4.next import DWARFRegisterMappingsManager
-from ghidra.util.task import ConsoleTaskMonitor
 from ghidra.app.util.opinion import ElfLoader
 from ghidra.framework import OperatingSystem
 
@@ -33,8 +30,6 @@ sys.path.append(libdwarf_jar_path)
 
 from libdwarf import LibdwarfLibrary
 from com.sun.jna.ptr import PointerByReference, LongByReference
-from com.sun.jna import Memory
-from java.nio import ByteBuffer
 
 
 curr = getCurrentProgram()
@@ -137,12 +132,26 @@ def add_debug_info():
     file_index = dwarf_add_file_decl(dbg, c_file_name, dir_index, 0, 0)
     dwarf_add_AT_comp_dir(cu, ".")
 
-    funcs = get_functions()
+    fm = curr.functionManager
+
     addr_to_line = {}
     max_addr = 0
-    for i, f in enumerate(funcs):
-        print "Decompiling function %d: %s" % (i, f)
-        die, func_addrs = add_function(cu, f, file_index)
+    monitor.setMessage("Decompiling functions...")
+    monitor.initialize(fm.functionCount)
+    for i, f in enumerate(fm.getFunctions(True)):
+        monitor.incrementProgress(1)
+        monitor.setMessage("Decompiling functions... %s" % (f,))
+        addr = f.entryPoint
+        # skip function if it's in the EXTERNAL address space or in the EXTERNAL memory block
+        if not addr or addr.isExternalAddress() or curr.memory.isExternalBlockAddress(addr):
+            continue
+        decomp_lines.append("/* Function %d: %s at %s */" % (i, f, addr))
+        try:
+            die, func_addrs = add_function(cu, f, file_index)
+        except Exception as e:
+            print "Failed to decompile %s @ %s: %s" (f, addr, e)
+            decomp_lines.append("/* Decompilation failed: %s */" % (e,))
+            continue
         addr_to_line.update(func_addrs)
         max_addr = max(max_addr, get_function_range(f)[1] + 1)
 
@@ -219,23 +228,8 @@ def add_decompiler_func_info(cu, func_die, func, decomp, file_index, func_line):
     return addr_to_line
 
 
-def get_functions():
-    fm = curr.functionManager
-    funcs = fm.getFunctions(True)
-    return funcs
-
-
 def get_function_range(func):
     return get_real_address(func.entryPoint), get_real_address(func.body.maxAddress)
-
-
-def is_function_executable(func):
-    f_start, f_end = get_function_range(func)
-    # Check for functions inside executable segments
-    for s in curr.memory.executeSet.addressRanges:
-        if f_start >= get_real_address(s.minAddress) and f_end <= get_real_address(s.maxAddress):
-            return True
-    return False
 
 
 def add_global_variables(cu):
@@ -470,14 +464,12 @@ class SectionsCallback(Dwarf_Callback_Func):
 
     def apply(self, name, *args):
         name = str(name.getString(0))
-        print "info_callback", name
         self.sections.append(name)
         return len(self.sections) - 1
 
 
 def generate_dwarf_sections():
     section_count = dwarf_transform_to_disk_form(dbg)
-    print "section_count", section_count
 
     sections = {}
     for i in xrange(section_count):
@@ -492,7 +484,6 @@ def generate_dwarf_sections():
         if section_name not in sections:
             sections[section_name] = ""
         sections[section_name] += content
-        print section_index, section_name, length
     return sections.items()
 
 
